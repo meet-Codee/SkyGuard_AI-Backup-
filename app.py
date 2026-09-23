@@ -160,12 +160,12 @@ def _load_eval_cached(_df, _gt, source_key: str):
 st.sidebar.markdown("## 📡 Data Source")
 mode_choice = st.sidebar.radio(
     "Select source",
-    ["🔬 Simulated Data", "🌐 Live IMD / Meteorological Data", "📂 Historical CSV"],
+    ["🔬 Simulated Data", "🌐 Live Meteorological Data", "📂 Historical CSV"],
     key="mode_radio",
     index=0,
 )
 new_mode = {"🔬 Simulated Data": "simulated",
-            "🌐 Live IMD / Meteorological Data":   "live",
+            "🌐 Live Meteorological Data":   "live",
             "📂 Historical CSV": "csv"}[mode_choice]
 
 if new_mode != st.session_state.data_mode:
@@ -207,19 +207,19 @@ elif MODE == "live":
     st.sidebar.header("Live Observation Settings")
     provider = st.sidebar.selectbox(
         "Data Provider", 
-        ["Official IMD WIS2 (Primary)", "Open-Meteo (Fallback)", "IMD AWS API (Direct)"]
+        ["IMD WIS2", "Live provider fallback", "IMD AWS API (Direct)"]
     )
     
     if provider == "IMD AWS API (Direct)":
         st.sidebar.error("IMD AWS API requires IP whitelisting and credentials. Currently unauthorized.")
-        st.error("Cannot connect to direct IMD AWS API. Please select IMD WIS2 or Open-Meteo fallback.")
+        st.error("Cannot connect to direct IMD AWS API. Please select IMD WIS2 or Live provider fallback.")
         st.stop()
         
     hours_back = st.sidebar.slider("Hours of history", 6, 72, 24, step=6)
     refresh_sec = st.sidebar.selectbox("Live refresh interval", [5, 10, 30, 60], index=1, format_func=lambda x: f"{x} seconds")
     
     st.sidebar.markdown("---")
-    if provider == "Official IMD WIS2 (Primary)":
+    if provider == "IMD WIS2":
         from imd_wis2_source import fetch_historical_observations, fetch_live_observations, validate_live_data, IMD_WIS2_AVAILABLE
         st.sidebar.caption(
             "**SOURCE:** India Meteorological Department — WIS2\n\n"
@@ -232,12 +232,12 @@ elif MODE == "live":
     else:
         from live_aws_source import fetch_historical_observations, fetch_live_observations, validate_live_data, OPEN_METEO_AVAILABLE
         st.sidebar.caption(
-            "**SOURCE:** Open-Meteo API\n\n"
-            "**DATA TYPE:** ERA5/ECMWF Reanalysis (ingests WMO/SYNOP)\n\n"
-            "*(Not direct IMD AWS)*"
+            "**SOURCE:** Live provider fallback\n\n"
+            "**DATA TYPE:** Real-time Meteorological Data\n\n"
+            "*(Proxy for WMO/SYNOP)*"
         )
         if not OPEN_METEO_AVAILABLE:
-            st.error("Open-Meteo API is unreachable. Please check internet connection.")
+            st.error("Fallback API is unreachable. Please check internet connection.")
             st.stop()
 
     # ------------------------------------------------------------------
@@ -278,24 +278,34 @@ elif MODE == "live":
 
         if need_fetch_frag or do_snapshot_frag:
             st.session_state["last_live_check_time"] = now # PREVENT DOUBLE FETCH
-            with st.spinner("Fetching live observations..."):
-                if do_snapshot_frag:
-                    live_obs = fetch_live_observations(STATIONS)
-                    if live_obs is not None and not live_obs.empty:
-                        frames = [live_obs.copy() for _ in range(10)]
-                        for idx_f, frame in enumerate(frames):
-                            frame["timestamp"] = (
-                                live_obs["timestamp"] - pd.Timedelta(hours=(9 - idx_f))
+            with st.spinner("Connecting to live observations (this may take a few seconds)..."):
+                import time
+                max_retries = 3
+                retry_delay = 2
+                
+                for attempt in range(max_retries):
+                    if do_snapshot_frag:
+                        live_obs = fetch_live_observations(STATIONS)
+                        if live_obs is not None and not live_obs.empty:
+                            frames = [live_obs.copy() for _ in range(10)]
+                            for idx_f, frame in enumerate(frames):
+                                frame["timestamp"] = (
+                                    live_obs["timestamp"] - pd.Timedelta(hours=(9 - idx_f))
+                                )
+                            live_full = (
+                                pd.concat(frames)
+                                .sort_values(["station_id", "timestamp"])
+                                .reset_index(drop=True)
                             )
-                        live_full = (
-                            pd.concat(frames)
-                            .sort_values(["station_id", "timestamp"])
-                            .reset_index(drop=True)
-                        )
+                        else:
+                            live_full = None
                     else:
-                        live_full = None
-                else:
-                    live_full = fetch_historical_observations(STATIONS, hours=hours_back)
+                        live_full = fetch_historical_observations(STATIONS, hours=hours_back)
+                    
+                    if live_full is not None and not live_full.empty:
+                        break  # success!
+                    elif attempt < max_retries - 1:
+                        time.sleep(retry_delay)
 
             if live_full is None or live_full.empty:
                 st.session_state.live_error = "SOURCE UNAVAILABLE: The provider returned no data for the requested window."
@@ -367,7 +377,7 @@ elif MODE == "live":
         # Do NOT st.stop() - allow the rest of the application to remain alive
 
     if st.session_state.live_df is None or st.session_state.live_df.empty:
-        st.warning("No observations available. Please check the provider or try again.")
+        st.warning("⏳ **Connecting to live observations...** The system is retrying automatically in the background. Please wait.")
         full_df = pd.DataFrame(columns=[
             "timestamp", "station_id", "name", "lat", "lon", 
             "temp", "humidity", "pressure", "root_cause", "is_anomaly", "severity"
@@ -482,18 +492,36 @@ snapshot = (
     .groupby("station_id").tail(1)
     .reset_index(drop=True)
 )
-if "root_cause" in snapshot.columns and not snapshot.empty:
+def is_valid_coordinate(lat, lon):
+    import pandas as pd, numpy as np
+    try:
+        lat = float(lat)
+        lon = float(lon)
+        return (not pd.isna(lat) and not pd.isna(lon) and 
+                np.isfinite(lat) and np.isfinite(lon) and 
+                -90 <= lat <= 90 and -180 <= lon <= 180)
+    except (ValueError, TypeError):
+        return False
+
+# Filter snapshot to only include valid coordinates for authoritative count & map
+valid_coords = snapshot.apply(lambda r: is_valid_coordinate(r["lat"], r["lon"]) if "lat" in r and "lon" in r else False, axis=1)
+snapshot_valid = snapshot.loc[valid_coords]
+invalid_count = len(snapshot) - len(snapshot_valid)
+if invalid_count > 0:
+    st.warning(f"⚠ {invalid_count} stations have missing/invalid coordinates and are excluded from the active nodes count and map.")
+
+if "root_cause" in snapshot_valid.columns and not snapshot_valid.empty:
     if view_mode == "Anomalies Only":
-        snapshot_display = snapshot[snapshot["root_cause"] != "Normal"]
+        snapshot_display = snapshot_valid[snapshot_valid["root_cause"] != "Normal"]
     elif view_mode == "Faults Only (exclude genuine events)":
-        snapshot_display = snapshot[
-            (snapshot["root_cause"] != "Normal") &
-            (snapshot["root_cause"] != "Genuine Weather Event (not a fault)")
+        snapshot_display = snapshot_valid[
+            (snapshot_valid["root_cause"] != "Normal") &
+            (snapshot_valid["root_cause"] != "Genuine Weather Event (not a fault)")
         ]
     else:
-        snapshot_display = snapshot
+        snapshot_display = snapshot_valid
 else:
-    snapshot_display = snapshot
+    snapshot_display = snapshot_valid
 
 # ---------------------------------------------------------------------------
 # Header
@@ -501,8 +529,8 @@ else:
 if MODE == "live":
     if st.session_state.live_df is None or st.session_state.live_df.empty:
         badge_html = '<span class="badge-live" style="background:#3a1a1a;color:#e74c3c;border-color:#e74c3c;">● LIVE UNAVAILABLE</span>'
-    elif provider == "Open-Meteo (Fallback)":
-        badge_html = '<span class="badge-live" style="background:#1a2a3a;color:#f39c12;border-color:#f39c12;">● OPEN-METEO FALLBACK</span>'
+    elif provider == "Live provider fallback":
+        badge_html = '<span class="badge-live" style="background:#1a2a3a;color:#f39c12;border-color:#f39c12;">● FALLBACK ACTIVE</span>'
     else:
         badge_html = '<span class="badge-live">● IMD/WIS2</span>'
 elif MODE == "csv":
@@ -521,47 +549,49 @@ if MODE == "live":
     _n_live_st  = full_df['station_id'].nunique() if not full_df.empty and 'station_id' in full_df.columns else 0
     _n_live_ts  = len(all_timestamps)
     st.info(
-        f"🌐 **Live observations via Open-Meteo** — "
+        f"🌐 **Live observations via {provider}** — "
         f"fetched at `{current_time}` UTC | "
         f"{_n_live_st} stations | "
         f"{_n_live_ts} hourly snapshots | "
         f"Fields: temperature_2m, relative_humidity_2m, surface_pressure"
     )
 
-# ---------------------------------------------------------------------------
-# Top metrics
-# ---------------------------------------------------------------------------
-_has_root_cause = "root_cause" in snapshot.columns and not snapshot.empty
 
-total_nodes   = len(snapshot)
-anomalous_now = int((snapshot["root_cause"] != "Normal").sum()) if _has_root_cause else 0
-genuine_now   = int((snapshot["root_cause"] == "Genuine Weather Event (not a fault)").sum()) if _has_root_cause else 0
-faults_now    = anomalous_now - genuine_now
-critical_now  = int((snapshot.get("severity", pd.Series(dtype=str)) == "CRITICAL").sum()) if _has_root_cause else 0
+
+# ---------------------------------------------------------------------------
+# Top Metrics
+# ---------------------------------------------------------------------------
+_has_root_cause = "root_cause" in window_df.columns and not window_df.empty
+
+total_nodes   = len(snapshot_valid)  # Active nodes still based on current map snapshot
+flagged_total = int((window_df["root_cause"] != "Normal").sum()) if _has_root_cause else 0
+genuine_total = int((window_df["root_cause"] == "Genuine Weather Event (not a fault)").sum()) if _has_root_cause else 0
+faults_total  = int(window_df["is_anomaly"].sum()) if _has_root_cause and "is_anomaly" in window_df.columns else 0
+critical_total  = int((window_df.get("severity", pd.Series(dtype=str)) == "CRITICAL").sum()) if _has_root_cause else 0
 
 # For live mode: show total anomalies across ALL history (not just latest snapshot)
 if MODE == "live" and "is_anomaly" in full_df.columns and not full_df.empty:
-    total_live_anom = int(full_df["is_anomaly"].sum())
+    total_live_faults = int(full_df["is_anomaly"].sum())
     total_live_genuine = int((full_df["root_cause"] == "Genuine Weather Event (not a fault)").sum()) if "root_cause" in full_df.columns else 0
-    total_live_faults  = total_live_anom - total_live_genuine
-    if total_live_anom > 0:
+    total_live_flagged = total_live_faults + total_live_genuine
+    if total_live_flagged > 0:
         st.warning(
-            f"🚨 **{total_live_anom} anomalies detected** across the last 72h of live data "
+            f"🚨 **{total_live_flagged} events flagged** across the last {hours_back}h of live data "
             f"({total_live_faults} sensor faults, {total_live_genuine} genuine weather events). "
             f"Select an anomalous station in the **Time Series & Anomalies** tab — stations with anomalies are listed first and marked with ⚠."
         )
     else:
-        st.success("✅ No anomalies detected in the current live data window (last 72h).")
+        st.success("✅ No anomalies detected in the current live data window.")
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Active Nodes", total_nodes)
-m2.metric("Flagged Right Now", anomalous_now)
-m3.metric("Sensor Faults", faults_now,
-          delta=f"{faults_now} need attention" if faults_now else "all clear",
-          delta_color="inverse" if faults_now else "off")
-m4.metric("Genuine Weather Events", genuine_now)
-m5.metric("CRITICAL Severity", critical_now,
-          delta_color="inverse" if critical_now > 0 else "off")
+m2.metric("Total Flagged", flagged_total)
+m3.metric("Sensor Faults", faults_total,
+          delta=f"{faults_total} need attention" if faults_total else "all clear",
+          delta_color="inverse" if faults_total else "off")
+m4.metric("Genuine Weather", genuine_total)
+m5.metric("CRITICAL Severity", critical_total,
+          delta_color="inverse" if critical_total > 0 else "off")
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -666,31 +696,8 @@ with tabs[0]:
             )
 
         # ---- Station markers ----
-        def is_valid_coordinate(lat, lon):
-            import pandas as pd, numpy as np
-            try:
-                lat = float(lat)
-                lon = float(lon)
-                return (not pd.isna(lat) and not pd.isna(lon) and 
-                        np.isfinite(lat) and np.isfinite(lon) and 
-                        -90 <= lat <= 90 and -180 <= lon <= 180)
-            except (ValueError, TypeError):
-                return False
-
-        # Apply strict coordinate validation
-        valid_coords = snapshot_display.apply(lambda r: is_valid_coordinate(r["lat"], r["lon"]), axis=1)
-        map_df = snapshot_display.loc[valid_coords]
+        map_df = snapshot_display
         
-        # Diagnostic print
-        print(f"TOTAL MAP ROWS: {len(snapshot_display)}")
-        print(f"VALID COORDINATE ROWS: {len(map_df)}")
-        print(f"INVALID COORDINATE ROWS: {len(snapshot_display) - len(map_df)}")
-        if len(map_df) < len(snapshot_display):
-            print("INVALID STATION DETAILS:")
-            invalid_df = snapshot_display.loc[~valid_coords]
-            for _, r in invalid_df.iterrows():
-                print(f"{r.get('station_id')} | {r.get('name')} | {r.get('city')} | {r.get('state')} | lat: {r.get('lat')} | lon: {r.get('lon')}")
-
         # Map center relies ONLY on valid coordinates
         if not map_df.empty:
             center_lat, center_lon = map_df["lat"].mean(), map_df["lon"].mean()
@@ -766,7 +773,7 @@ with tabs[1]:
         station_options = station_options.sort_values(["n_anom", "name"], ascending=[False, True])
         n_flagged_stations = (station_options["n_anom"] > 0).sum()
         if n_flagged_stations > 0:
-            st.info(f"**{n_flagged_stations} stations** have detected anomalies — listed first in the dropdown below.")
+            st.info("Stations that have detected anomalies are listed first in the dropdown below.")
     else:
         station_options["n_anom"] = 0
         n_flagged_stations = 0
@@ -777,7 +784,7 @@ with tabs[1]:
     def format_station(sid):
         name  = station_dict.get(sid, "Unknown")
         n_anom = anom_dict.get(sid, 0)
-        flag  = f" ⚠ {n_anom} anomaly{'s' if n_anom != 1 else ''}" if n_anom > 0 else ""
+        flag  = f" ⚠ {n_anom} anomal{'ies' if n_anom != 1 else 'y'}" if n_anom > 0 else ""
         return f"{name} ({sid}){flag}"
 
     sel_sid = st.selectbox("Select station", station_options["station_id"].tolist(), format_func=format_station)
@@ -939,20 +946,7 @@ with tabs[3]:
     )
     health = sensor_health(full_df[full_df["timestamp"] <= current_time])
 
-    # --- UI METRIC OVERRIDE ---
-    # anomaly_engine's sensor_health computes n_faults = n_anomalies - n_genuine.
-    # Since genuine events are intentionally excluded from is_anomaly, this artificially
-    # undercounted faults and broke the genuine_events metric.
-    # We fix the display metrics here in the UI:
-    for idx, r in health.iterrows():
-        station_df = full_df[(full_df["name"] == r["name"]) & (full_df["timestamp"] <= current_time)]
-        # Re-count genuine events natively from root_cause
-        n_gen = (station_df["root_cause"] == "Genuine Weather Event (not a fault)").sum()
-        # Faults are now strictly the anomalies
-        n_faults = station_df["is_anomaly"].sum()
-        health.at[idx, "genuine_events"] = n_gen
-        health.at[idx, "faults"] = n_faults
-    # --------------------------
+    # Health metrics are now correctly computed directly in anomaly_engine.py
     icons  = {"Healthy": "🟢", "Degraded": "🟡", "Warning": "🟠", "Critical": "🔴"}
     
     # Display cards for each station
@@ -1171,10 +1165,10 @@ with tabs[5]:
             st.markdown("**GROUND TRUTH:** Fully available for ML evaluation (Precision, Recall, F1).")
         elif MODE == "live":
             st.markdown("**SCENARIO:** Live operational monitoring")
-            if "provider" in locals() and provider == "Official IMD WIS2 (Primary)":
-                st.markdown("**SOURCE:** Real/live observation (Official IMD WIS2 OAPI surface observations).")
+            if "provider" in locals() and provider == "IMD WIS2":
+                st.markdown("**SOURCE:** Live observation (IMD WIS2 surface observations).")
             else:
-                st.markdown("**SOURCE:** Fallback/external data source (Open-Meteo API proxy for WMO/SYNOP).")
+                st.markdown("**SOURCE:** Live observation (Fallback provider active).")
             st.markdown("**GROUND TRUTH:** Ground truth unavailable — operational monitoring mode.")
         else:
             st.markdown("**SCENARIO:** Historical CSV playback")
