@@ -1,0 +1,63 @@
+# Dev scripts (not needed for deployment)
+dump_*.py
+fix_*.py
+patch_*.py
+probe_*.py
+diagnose_*.py
+diag_*.py
+audit_*.py
+check_*.py
+scan_*.py
+regression*.py
+smoke*.py
+test_*.py
+evaluate_*.py
+validate_*.py
+stage2_*.py
+sweep_*.py
+benchmark.py
+generate_handover.py
+build_*.py
+rebuild_*.py
+explore_*.py
+fetch_*.py
+find_*.py
+get_*.py
+process_*.py
+download_*.py
+investigate_*.py
+verify.py
+temp.py
+update_*.py
+replace_*.py
+rename_*.py
+schema_*.py
+
+# Output / dump files
+*.txt
+*.bak
+*.log
+
+# Scratch files
+scratch/
+scripts/
+src/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Dev data (large JSON files not needed — station data is in data_engine.py)
+stations_india_old.json
+stations_india_synthetic_backup.json
+wis2_stations_raw.json
+real_indian_stations.csv
+registry_audit_output.txt
+
+# Virtual environment
+venv/
+.env
+*.egg-info/
