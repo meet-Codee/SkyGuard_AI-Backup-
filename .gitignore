@@ -35,6 +35,7 @@ schema_*.py
 
 # Output / dump files
 *.txt
+!requirements.txt
 *.bak
 *.log
 
