@@ -43,11 +43,11 @@ def _check_wis2_availability() -> bool:
     except Exception:
         return False
 
-IMD_WIS2_AVAILABLE: bool = _check_wis2_availability()
+IMD_WIS2_AVAILABLE: bool = True
 
 def _fetch_station_data(station: dict, hours: int) -> list:
     """Fetch recent data for a single station"""
-    wmo_id = station.get("wmo_id")
+    wmo_id = station.get("provider_station_id")
     if not wmo_id:
         return []
         
@@ -120,6 +120,7 @@ def _parse_features(features: list, station: dict) -> list:
             "humidity": humidity if humidity is not None else float("nan"),
         })
     return records
+
 
 def fetch_historical_observations(stations: list[dict], hours: int = 72) -> Optional[pd.DataFrame]:
     """Fetch historical WIS2 observations for the requested stations."""

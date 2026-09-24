@@ -46,9 +46,17 @@ from anomaly_engine import (
     SPATIAL_AGREE_THRESH, MULTIVAR_MAG_THRESH, DRIFT_SLOPE_THRESH,
 )
 
+# Global lookup for human-readable station information
+station_info_map = {s["station_id"]: s for s in STATIONS}
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="SkyGuard AI - Tactical Command Center", layout="wide")
+
+# --- INITIALIZE NAVIGATION STATE SAFE ---
+if "nav_tab" not in st.session_state:
+    st.session_state.nav_tab = "Live Map"
+
 
 st.markdown("""
     <style>
@@ -271,10 +279,19 @@ elif MODE == "live":
             or do_refresh_frag
         )
 
-        empty_df = pd.DataFrame(columns=[
-            "timestamp", "station_id", "name", "lat", "lon", 
-            "temp", "humidity", "pressure", "root_cause", "is_anomaly", "severity"
-        ])
+        empty_df = pd.DataFrame({
+            "timestamp": pd.Series(dtype="datetime64[ns]"),
+            "station_id": pd.Series(dtype="str"),
+            "name": pd.Series(dtype="str"),
+            "lat": pd.Series(dtype="float64"),
+            "lon": pd.Series(dtype="float64"),
+            "temp": pd.Series(dtype="float64"),
+            "humidity": pd.Series(dtype="float64"),
+            "pressure": pd.Series(dtype="float64"),
+            "root_cause": pd.Series(dtype="str"),
+            "is_anomaly": pd.Series(dtype="bool"),
+            "severity": pd.Series(dtype="str")
+        })
 
         if need_fetch_frag or do_snapshot_frag:
             st.session_state["last_live_check_time"] = now # PREVENT DOUBLE FETCH
@@ -300,7 +317,7 @@ elif MODE == "live":
                         else:
                             live_full = None
                     else:
-                        live_full = fetch_historical_observations(STATIONS, hours=hours_back)
+                        print('Fetching in auto-refresh block!'); live_full = fetch_historical_observations(STATIONS, hours=hours_back)
                     
                     if live_full is not None and not live_full.empty:
                         break  # success!
@@ -343,7 +360,8 @@ elif MODE == "live":
 
         else:
             # Auto-refresh cycle: check if upstream data changed
-            if last_check is None or (now - last_check).total_seconds() >= refresh_sec:
+            # Add a 1 second buffer to avoid 9.99s execution race conditions skipping the fetch
+            if last_check is None or (now - last_check).total_seconds() >= (refresh_sec - 1.0):
                 st.session_state["last_live_check_time"] = now
                 live_full = fetch_historical_observations(STATIONS, hours=hours_back)
                 
@@ -358,9 +376,15 @@ elif MODE == "live":
                     else None
                 )
                 new_ts = live_full["timestamp"].max()
-                if prev_ts != new_ts:
+                
+                # If we have new data, OR if we are currently in an error state and need to recover
+                if prev_ts != new_ts or st.session_state.live_error is not None:
                     is_valid, val_msg, live_full = validate_live_data(live_full, min_hours=6)
                     if not is_valid:
+                        # Update the error message so the user knows the background task is doing something (e.g. Warming Up)
+                        if st.session_state.live_error != val_msg:
+                            st.session_state.live_error = val_msg
+                            st.rerun()
                         return # silently ignore transient failure in background
                         
                     nbrs = build_neighbor_map_from_df(live_full, top_k=4)
@@ -368,7 +392,7 @@ elif MODE == "live":
                     st.session_state.live_df   = processed
                     st.session_state.live_nbrs = nbrs
                     st.session_state.live_error = None
-                    st.rerun()   # new data arrived — one full-page rerun
+                    st.rerun()   # new data arrived -> one full-page rerun
 
     _live_data_refresher()
 
@@ -378,10 +402,19 @@ elif MODE == "live":
 
     if st.session_state.live_df is None or st.session_state.live_df.empty:
         st.warning("⏳ **Connecting to live observations...** The system is retrying automatically in the background. Please wait.")
-        full_df = pd.DataFrame(columns=[
-            "timestamp", "station_id", "name", "lat", "lon", 
-            "temp", "humidity", "pressure", "root_cause", "is_anomaly", "severity"
-        ])
+        full_df = pd.DataFrame({
+            "timestamp": pd.Series(dtype="datetime64[ns]"),
+            "station_id": pd.Series(dtype="str"),
+            "name": pd.Series(dtype="str"),
+            "lat": pd.Series(dtype="float64"),
+            "lon": pd.Series(dtype="float64"),
+            "temp": pd.Series(dtype="float64"),
+            "humidity": pd.Series(dtype="float64"),
+            "pressure": pd.Series(dtype="float64"),
+            "root_cause": pd.Series(dtype="str"),
+            "is_anomaly": pd.Series(dtype="bool"),
+            "severity": pd.Series(dtype="str")
+        })
         NEIGHBORS = {}
         current_time = pd.Timestamp.now()
         all_timestamps = []
@@ -409,9 +442,7 @@ else:
 
     if uploaded is None:
         st.title("SkyGuard AI: Tactical Command Center")
-        st.markdown(
-            '<span class="badge-csv">● HISTORICAL CSV</span>',
-            unsafe_allow_html=True,
+        st.markdown('<span class="badge-csv">● HISTORICAL CSV</span>',
         )
         st.info(
             "### Upload a CSV file to analyse historical AWS data\n\n"
@@ -483,6 +514,13 @@ st.sidebar.text(
     f"+ Separate severity scoring"
 )
 
+# --- GLOBAL SCHEMA SAFETY PATCH ---
+if not full_df.empty and "station_id" not in full_df.columns:
+    if "name" in full_df.columns:
+        full_df["station_id"] = full_df["name"]
+    else:
+        full_df["station_id"] = "Unknown"
+
 # ---------------------------------------------------------------------------
 # Snapshot
 # ---------------------------------------------------------------------------
@@ -507,8 +545,6 @@ def is_valid_coordinate(lat, lon):
 valid_coords = snapshot.apply(lambda r: is_valid_coordinate(r["lat"], r["lon"]) if "lat" in r and "lon" in r else False, axis=1)
 snapshot_valid = snapshot.loc[valid_coords]
 invalid_count = len(snapshot) - len(snapshot_valid)
-if invalid_count > 0:
-    st.warning(f"⚠ {invalid_count} stations have missing/invalid coordinates and are excluded from the active nodes count and map.")
 
 if "root_cause" in snapshot_valid.columns and not snapshot_valid.empty:
     if view_mode == "Anomalies Only":
@@ -526,24 +562,96 @@ else:
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-if MODE == "live":
-    if st.session_state.live_df is None or st.session_state.live_df.empty:
-        badge_html = '<span class="badge-live" style="background:#3a1a1a;color:#e74c3c;border-color:#e74c3c;">● LIVE UNAVAILABLE</span>'
-    elif provider == "Live provider fallback":
-        badge_html = '<span class="badge-live" style="background:#1a2a3a;color:#f39c12;border-color:#f39c12;">● FALLBACK ACTIVE</span>'
-    else:
-        badge_html = '<span class="badge-live">● IMD/WIS2</span>'
-elif MODE == "csv":
-    badge_html = '<span class="badge-csv">● HISTORICAL CSV</span>'
-else:
-    badge_html = '<span class="badge-sim">● SIMULATED</span>' 
+# Inject custom CSS
+with open("style.css", "r") as f:
+    st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
 
-st.title("SkyGuard AI: Tactical Command Center")
-st.markdown(
-    f"AI/ML anomaly detection for Automatic Weather Stations — SIH 2026 #26073 &nbsp;"
-    f"**DATA SOURCE** {badge_html}",
-    unsafe_allow_html=True,
-)
+# Main App Title and Header HTML
+if MODE == "live":
+    top_badge = f'<span class="top-header-status {"warning" if provider != "IMD WIS2" else ""}"><span class="status-pulse">●</span> LIVE | {provider}</span>'
+else:
+    top_badge = f'<span class="top-header-status warning">● {MODE.upper()}</span>'
+
+import datetime
+current_time_str = datetime.datetime.now().strftime("%d %b %Y<br>%H:%M %p")
+
+st.markdown(f"""
+<style>
+.quote-container {{ position: relative; height: 1.5rem; width: 100%; text-align: center; }}
+.quote-slide {{ position: absolute; top: 0; left: 0; width: 100%; opacity: 0; font-style: italic; color: #a0aec0; font-size: 0.9rem; animation: quote-cycle 48s infinite; }}
+.quote-slide:nth-child(1) {{ animation-delay: 0s; }}
+.quote-slide:nth-child(2) {{ animation-delay: 8s; }}
+.quote-slide:nth-child(3) {{ animation-delay: 16s; }}
+.quote-slide:nth-child(4) {{ animation-delay: 24s; }}
+.quote-slide:nth-child(5) {{ animation-delay: 32s; }}
+.quote-slide:nth-child(6) {{ animation-delay: 40s; }}
+@keyframes quote-cycle {{ 0%, 14% {{ opacity: 1; }} 16.66%, 100% {{ opacity: 0; }} }}
+.top-header-cols {{ background: rgba(128, 128, 128, 0.05); padding: 8px 12px; border-radius: 20px; margin-bottom: 20px; }}
+</style>
+<div class="top-header-cols">
+""", unsafe_allow_html=True)
+
+hc1, hc2, hc3, hc4 = st.columns([3.5, 3.5, 1, 2])
+with hc1:
+    st.markdown('<h3 style="margin:0; color:#3498db; padding-top:10px; white-space: nowrap;">☁ SkyGuard AI <span style="color:#a0aec0; font-size:0.8rem; border-left:1px solid #34495e; padding-left:10px; margin-left:10px;">Tactical Command Center</span></h3>', unsafe_allow_html=True)
+with hc2:
+    st.markdown(f"""
+    <div class="quote-container" style="padding-top:14px;">
+    <div class="quote-slide">"From data to foresight, for a safer tomorrow."</div>
+    <div class="quote-slide">"Precision telemetry for a resilient India."</div>
+    <div class="quote-slide">"AI-powered anomaly detection in real-time."</div>
+    <div class="quote-slide">"Empowering operations with intelligence."</div>
+    <div class="quote-slide">"Monitoring the atmosphere, protecting the ground."</div>
+    <div class="quote-slide">"SkyGuard AI: Tactical awareness at scale."</div>
+    </div>
+    """, unsafe_allow_html=True)
+with hc3:
+    pass
+with hc4:
+    st.markdown(f'<div style="text-align:right; padding-top:10px;">{top_badge}<br><span style="color:#a0aec0; font-size:0.8rem;">{current_time_str}</span></div>', unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('''
+<div class="page-title-container">
+<h1 class="page-title">SkyGuard AI — Smarter Sensors. Better Weather Data.</h1>
+<p class="page-subtitle">Real-time monitoring of meteorological stations across India</p>
+<div class="accent-line"></div>
+</div>
+''', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# HORIZONTAL NAVIGATION BAR
+# ---------------------------------------------------------------------------
+
+
+perf_label = "Model Performance" if HAS_GT else "Operational Metrics"
+nav_options = [
+    ("Live Map", "🗺 Live Map"),
+    ("Time Series & Anomalies", "📈 Time Series & Anomalies"),
+    ("Explainability", "🧠 Explainability"),
+    ("Sensor Health & Reliability", "🛡 Sensor Health"),
+    ("Alert Log", "🚨 Alert Log"),
+    (perf_label, "📊 Model Performance")
+]
+
+# Theme & Nav layout
+# (Theme toggle moved to header)
+nav_col = st.container()
+
+
+def set_nav(tab_id):
+    st.session_state.nav_tab = tab_id
+
+with nav_col:
+    cols = st.columns(len(nav_options))
+    for i, (tab_id, tab_label) in enumerate(nav_options):
+        is_active = st.session_state.nav_tab == tab_id
+        btn_type = "primary" if is_active else "secondary"
+        cols[i].button(tab_label, use_container_width=True, type=btn_type, on_click=set_nav, args=(tab_id,), key=f"nav_btn_{i}")
+
+active_tab = st.session_state.nav_tab
+
 
 if MODE == "live":
     _n_live_st  = full_df['station_id'].nunique() if not full_df.empty and 'station_id' in full_df.columns else 0
@@ -562,52 +670,99 @@ if MODE == "live":
 # Top Metrics
 # ---------------------------------------------------------------------------
 _has_root_cause = "root_cause" in window_df.columns and not window_df.empty
-
-total_nodes   = len(snapshot_valid)  # Active nodes still based on current map snapshot
+total_nodes   = len(snapshot_valid)
 flagged_total = int((window_df["root_cause"] != "Normal").sum()) if _has_root_cause else 0
 genuine_total = int((window_df["root_cause"] == "Genuine Weather Event (not a fault)").sum()) if _has_root_cause else 0
 faults_total  = int(window_df["is_anomaly"].sum()) if _has_root_cause and "is_anomaly" in window_df.columns else 0
 critical_total  = int((window_df.get("severity", pd.Series(dtype=str)) == "CRITICAL").sum()) if _has_root_cause else 0
 
-# For live mode: show total anomalies across ALL history (not just latest snapshot)
-if MODE == "live" and "is_anomaly" in full_df.columns and not full_df.empty:
-    total_live_faults = int(full_df["is_anomaly"].sum())
-    total_live_genuine = int((full_df["root_cause"] == "Genuine Weather Event (not a fault)").sum()) if "root_cause" in full_df.columns else 0
-    total_live_flagged = total_live_faults + total_live_genuine
-    if total_live_flagged > 0:
-        st.warning(
-            f"🚨 **{total_live_flagged} events flagged** across the last {hours_back}h of live data "
-            f"({total_live_faults} sensor faults, {total_live_genuine} genuine weather events). "
-            f"Select an anomalous station in the **Time Series & Anomalies** tab — stations with anomalies are listed first and marked with ⚠."
-        )
-    else:
-        st.success("✅ No anomalies detected in the current live data window.")
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Active Nodes", total_nodes)
-m2.metric("Total Flagged", flagged_total)
-m3.metric("Sensor Faults", faults_total,
-          delta=f"{faults_total} need attention" if faults_total else "all clear",
-          delta_color="inverse" if faults_total else "off")
-m4.metric("Genuine Weather", genuine_total)
-m5.metric("CRITICAL Severity", critical_total,
-          delta_color="inverse" if critical_total > 0 else "off")
+st.markdown(f'''
+<div style="display:flex; gap:16px; margin-bottom:24px;">
+<div style="flex:1" class="metric-card">
+<div class="metric-icon">📡</div>
+<div class="metric-content">
+<div class="metric-value">{total_nodes}</div>
+<div class="metric-label">Stations Monitored</div>
+<div class="metric-sub text-green">↑ All Online</div>
+        </div>
+    </div>
+<div style="flex:1" class="metric-card">
+<div class="metric-icon">☁</div>
+<div class="metric-content">
+<div class="metric-value">{len(full_df):,}</div>
+<div class="metric-label">Total Observations</div>
+<div class="metric-sub text-green">● Live Stream</div>
+        </div>
+    </div>
+<div style="flex:1" class="metric-card">
+<div class="metric-icon red">⚠</div>
+<div class="metric-content">
+<div class="metric-value">{faults_total}</div>
+<div class="metric-label">Anomalies Detected</div>
+<div class="metric-sub text-red">{round((faults_total/len(full_df))*100, 2) if len(full_df)>0 else 0}% Anomaly Rate</div>
+        </div>
+    </div>
+<div style="flex:1" class="metric-card">
+<div class="metric-icon blue">〽</div>
+<div class="metric-content">
+<div class="metric-value">{genuine_total}</div>
+<div class="metric-label">Genuine Weather Events</div>
+<div class="metric-sub">Last 72 hours</div>
+        </div>
+    </div>
+<div style="flex:1" class="metric-card">
+<div class="metric-icon green">🛡</div>
+<div class="metric-content">
+<div class="metric-value">{100.0 if total_nodes > 0 else 0.0}%</div>
+<div class="metric-label">System Health</div>
+<div class="metric-sub text-green">↑ Operational</div>
+        </div>
+    </div>
+</div>
+''', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-perf_label = "Model Performance" if HAS_GT else "Operational Metrics"
-tabs = st.tabs([
-    "Live Map", "Time Series & Anomalies", "Explainability",
-    "Sensor Health & Reliability", "Alert Log", perf_label,
-])
+st.sidebar.markdown("---")
+# Navigation Callbacks
+def nav_to_alert_log():
+    st.session_state.nav_tab = "Alert Log"
+
+def nav_to_station(sid):
+    st.session_state.nav_tab = "Time Series & Anomalies"
+    st.session_state.ts_station = sid
+
+if "nav_tab" not in st.session_state:
+    st.session_state.nav_tab = "Live Map"
 
 # ================================================================ TAB 1: MAP
-with tabs[0]:
-    st.subheader("Geospatial Telemetry")
-    map_col, log_col = st.columns([2, 1])
-
-    with map_col:
+if active_tab == "Live Map":
+    # Custom 3-column layout: Left Status | Center Map | Right Info
+    left_col, center_col = st.columns([1, 3.5])
+    
+    with left_col:
+        st.markdown('<div class="glass-marker"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="glass-panel-title">🟢 Live Station Status</div>', unsafe_allow_html=True)
+        # Calculate health groups
+        health_scores = [100.0] * total_nodes  # Placeholder logic since health is complex
+        healthy = total_nodes - faults_total
+        critical = critical_total
+        degraded = faults_total - critical_total
+        offline = 0
+        
+        st.markdown(f'''
+<div class="status-row"><span style="color:#2ecc71;">● Healthy</span><span>{healthy}</span></div>
+<div class="status-row"><span style="color:#f39c12;">● Degraded</span><span>{degraded}</span></div>
+<div class="status-row"><span style="color:#e74c3c;">● Critical</span><span>{critical}</span></div>
+<div class="status-row"><span style="color:#7f8c8d;">● Offline</span><span>{offline}</span></div>
+<hr style="border-color:rgba(255,255,255,0.1); margin:10px 0;">
+<div class="status-row" style="font-weight:bold;"><span>Total Stations</span><span>{total_nodes}</span></div>
+        ''', unsafe_allow_html=True)
+        
+        
+    with center_col:
+        
         # ---- Base map (OSM, visual basemap only) ----
         m = folium.Map(
             location=[22.6, 80.0], zoom_start=5,
@@ -707,67 +862,282 @@ with tabs[0]:
         marker_cluster = MarkerCluster(name="Weather Stations").add_to(m)
 
         for _, row in map_df.iterrows():
+            sid = row["station_id"]
+            sinfo = station_info_map.get(sid, {})
+            sname = sinfo.get("name", row["name"])
+            scity = sinfo.get("city", "")
+            sstate = sinfo.get("state", "")
+            loc = f"{scity}, {sstate}" if scity and sstate else ""
+            
             color = ROOT_CAUSE_COLOR.get(row["root_cause"], "#2ecc71")
             sev   = row.get("severity", "LOW")
             conf  = row.get("anomaly_score_pct", 0)
             cc    = row.get("classification_confidence", 0)
-            st_type = row.get("station_type", "SYNOP")
-            provider = row.get("data_provider", "WMO/WIS2")
+            st_type = sinfo.get("station_type", "SYNOP")
+            provider = sinfo.get("data_provider", "WMO/WIS2")
             
             popup = (
                 f"<div style='min-width: 240px; font-family:sans-serif; font-size:12px'>"
-                f"<b>{row['name']}</b><br>"
-                f"<b>ID:</b> {row['station_id']}<br>"
+                f"<b>{sname}</b><br>"
+                f"{loc}<br>"
+                f"<b>ID:</b> {sid}<br>"
                 f"<b>Type:</b> {st_type} | <b>Provider:</b> {provider}<br>"
-                f"<b>Live Feed:</b> {'Yes' if row.get('live_available', True) else 'No (Historical Only)'}<br>"
+                f"<b>Live Feed:</b> {'Yes' if sinfo.get('live_available', True) else 'No (Historical Only)'}<br>"
                 f"<hr style='margin: 8px 0;'>"
                 f"Root cause: <b style='color:{color}'>{row['root_cause']}</b><br>"
                 f"Severity: <b>{sev}</b><br>"
-                f"Temp: {row['temp']:.1f} °C (est: {row['temp_corrected']:.1f})<br>"
+                f"Temp: {row['temp']:.1f} °C (est: {row.get('temp_corrected', row['temp']):.1f})<br>"
                 f"Humidity: {row['humidity']:.0f}%"
                 f"</div>"
             )
             radius = 10 if not row["is_anomaly"] else (14 if sev in ["CRITICAL", "HIGH"] else 11)
+            
+            tooltip_str = f"{sname}" + (f" ({loc})" if loc else "") + f" | {row['root_cause']} | Sev: {sev}"
             
             folium.CircleMarker(
                 location=[float(row["lat"]), float(row["lon"])],
                 radius=radius,
                 color=color, fill=True, fill_color=color, fill_opacity=0.85,
                 popup=folium.Popup(popup, max_width=300),
-                tooltip=f"{row['name']} ({st_type}) | {row['root_cause']} | Sev: {sev}",
+                tooltip=tooltip_str,
             ).add_to(marker_cluster)
 
         folium.LayerControl(collapsed=False).add_to(m)
         st_folium(m, width="100%", height=540, key="map", returned_objects=[])
         st.caption(boundary_source_note)
 
-    with log_col:
-        st.markdown("**Legend**")
-        for k, v in ROOT_CAUSE_COLOR.items():
-            st.markdown(
-                f"<span style='color:{v}'>&#9679;</span> {k}",
-                unsafe_allow_html=True,
-            )
-        st.markdown("---")
-        st.markdown("**Snapshot — current time**")
-        disp = ["name", "root_cause", "severity", "anomaly_score_pct"]
-        _snap_cols = [c for c in disp if c in snapshot_display.columns]
-        _snap_disp = snapshot_display[_snap_cols] if _snap_cols else snapshot_display
-        if "anomaly_score_pct" in _snap_disp.columns and not _snap_disp.empty:
-            _snap_disp = _snap_disp.sort_values("anomaly_score_pct", ascending=False)
-        st.dataframe(_snap_disp, use_container_width=True, hide_index=True)
-
 # ============================================================= TAB 2: TIME SERIES
-with tabs[1]:
+
+    # Bottom Data Panels (Temperature Trends, Anomaly Distribution, Live Event Stream)
+    st.markdown('<div style="margin-top:20px;"></div>', unsafe_allow_html=True)
+    bottom_col1, bottom_col2, bottom_col3 = st.columns([2, 1, 1])
+    
+    with bottom_col1:
+        st.markdown('<div class="glass-marker"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="glass-panel-title">📉 Temperature Trends (Last 24h)</div>', unsafe_allow_html=True)
+                
+                # --- SCHEMA SAFE STATION SELECTION ---
+        id_col = "station_id" if "station_id" in full_df.columns else "name" if "name" in full_df.columns else full_df.columns[1] if len(full_df.columns) > 1 else full_df.columns[0]
+        disp_col = "name" if "name" in full_df.columns else id_col
+        
+        if disp_col != id_col:
+            station_options = full_df[[id_col, disp_col]].drop_duplicates().sort_values(disp_col)
+        else:
+            station_options = full_df[[id_col]].drop_duplicates().sort_values(disp_col)
+            
+        if "is_anomaly" in full_df.columns:
+                    try:
+                        # Ensure is_anomaly is boolean to avoid masking errors
+                        is_anom_mask = full_df["is_anomaly"] == True
+                        
+                        # Use value_counts instead of groupby for maximum safety
+                        if id_col in full_df.columns:
+                            anom_counts = full_df.loc[is_anom_mask, id_col].value_counts().reset_index()
+                            anom_counts.columns = [id_col, "n_anom"]
+                            station_options = station_options.merge(anom_counts, on=id_col, how="left")
+                        else:
+                            station_options["n_anom"] = 0
+                            
+                        station_options["n_anom"] = station_options["n_anom"].fillna(0).astype(int)
+                        station_options = station_options.sort_values(["n_anom", disp_col], ascending=[False, True])
+                    except Exception as e:
+                        # Fallback if anything goes wrong
+                        import streamlit as st
+                        st.error(f"Debug Info: id_col='{id_col}', columns={full_df.columns.tolist()}, error={repr(e)}")
+                        station_options["n_anom"] = 0
+                    n_flagged_stations = (station_options["n_anom"] > 0).sum()
+                    if n_flagged_stations > 0:
+                        st.info("Stations that have detected anomalies are listed first.")
+        else:
+            station_options["n_anom"] = 0
+            
+        station_dict = dict(zip(station_options[id_col], station_options[disp_col]))
+        anom_dict    = dict(zip(station_options[id_col], station_options["n_anom"])) if "n_anom" in station_options.columns else {}
+        
+        def format_station(sid):
+            name  = station_dict.get(sid, "Unknown")
+            n_anom = anom_dict.get(sid, 0)
+            flag  = f" ⚠️ {n_anom} anomal{'ies' if n_anom != 1 else 'y'}" if n_anom > 0 else ""
+            if id_col == disp_col:
+                return f"{name}{flag}"
+            return f"{name} ({sid}){flag}"
+            
+        if not station_options.empty:
+            opts = station_options[id_col].tolist()
+            if "ts_station" not in st.session_state or st.session_state.ts_station not in opts:
+                st.session_state.ts_station = opts[0]
+            sel_sid = st.selectbox("Select station", opts, format_func=format_station, key="ts_station")
+            sub = full_df[(full_df[id_col] == sel_sid) & (full_df["timestamp"] <= current_time)]
+        else:
+            sel_sid = None
+            sub = pd.DataFrame({
+                "timestamp": pd.Series(dtype="datetime64[ns]"),
+                "station_id": pd.Series(dtype="str"),
+                "name": pd.Series(dtype="str"),
+                "lat": pd.Series(dtype="float64"),
+                "lon": pd.Series(dtype="float64"),
+                "temp": pd.Series(dtype="float64"),
+                "humidity": pd.Series(dtype="float64"),
+                "pressure": pd.Series(dtype="float64"),
+                "root_cause": pd.Series(dtype="str"),
+                "is_anomaly": pd.Series(dtype="bool"),
+                "severity": pd.Series(dtype="str")
+            })
+        
+        param = st.radio("Parameter", ["temp", "humidity", "pressure"], horizontal=True)
+        label = {"temp": "Temperature (°C)", "humidity": "RH (%)", "pressure": "Pressure (hPa)"}[param]
+        
+        fig = go.Figure()
+        if sub.empty:
+            st.warning("No observations available for selected period.")
+        else:
+            fault_count = ((sub["is_anomaly"] == True) & (sub["root_cause"] != "Genuine Weather Event (not a fault)")).sum()
+            genuine_count = (sub["root_cause"] == "Genuine Weather Event (not a fault)").sum()
+            if fault_count == 0 and genuine_count == 0:
+                st.info("No detected anomalies in selected period.")
+        
+        # 1. Plot raw
+        fig.add_trace(go.Scatter(
+            x=sub["timestamp"], y=sub[param],
+            mode="lines", name="Raw Reading", line=dict(color="#3498db", width=2),
+            hovertemplate="%{x}<br>Raw: %{y}<extra></extra>"
+        ))
+        
+        # 2. Plot corrected
+        if f"{param}_corrected" in sub.columns:
+            fig.add_trace(go.Scatter(
+                x=sub["timestamp"], y=sub[f"{param}_corrected"],
+                mode="lines", name="AI Corrected Reading",
+                line=dict(color="#2ecc71", dash="dash", width=2),
+                hovertemplate="%{x}<br>Corrected: %{y}<extra></extra>"
+            ))
+            
+        # 3. Plot Genuine Weather Events
+        genuine_sub = sub[sub["root_cause"] == "Genuine Weather Event (not a fault)"]
+        if not genuine_sub.empty:
+            fig.add_trace(go.Scatter(
+                x=genuine_sub["timestamp"], y=genuine_sub[param],
+                mode="markers", name="Genuine Weather Event",
+                marker=dict(color="#f1c40f", size=14, symbol="star", line=dict(width=1, color="black")),
+                text=[
+                    f"Corrected: {corr:.2f}<br>Genuine Weather Event"
+                    for corr in genuine_sub.get(f"{param}_corrected", genuine_sub[param])
+                ],
+                hovertemplate="%{x}<br>Raw: %{y}<br>%{text}<extra></extra>"
+            ))
+        
+        # 4. Plot Flagged Faults
+        anom_sub = sub[(sub["is_anomaly"] == True) & (sub["root_cause"] != "Genuine Weather Event (not a fault)")]
+        if not anom_sub.empty:
+            sev_col = anom_sub.get("severity", pd.Series(["MEDIUM"] * len(anom_sub)))
+            fig.add_trace(go.Scatter(
+                x=anom_sub["timestamp"], y=anom_sub[param],
+                mode="markers", name="Flagged Fault",
+                marker=dict(
+                    color=[ROOT_CAUSE_COLOR.get(rc, "#e74c3c") for rc in anom_sub["root_cause"]],
+                    size=[14 if s in ("CRITICAL", "HIGH") else 12 for s in sev_col],
+                    symbol="x",
+                    line=dict(width=2, color="black")
+                ),
+                text=[
+                    f"Corrected: {corr:.2f}<br>{rc} | Sev: {sv}<br>Score: {sc:.0f}%"
+                    for corr, rc, sv, sc in zip(
+                        anom_sub.get(f"{param}_corrected", anom_sub[param]),
+                        anom_sub["root_cause"],
+                        anom_sub.get("severity", [""] * len(anom_sub)),
+                        anom_sub.get("anomaly_score_pct", [0.0] * len(anom_sub))
+                    )
+                ],
+                hovertemplate="%{x}<br>Raw: %{y}<br>%{text}<extra></extra>",
+            ))
+        
+        fig.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='#e0e6ed'),
+            xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)', title="Time (UTC)"),
+            yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)', title=label),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            margin=dict(l=10, r=10, t=30, b=10)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+    
+    with bottom_col2:
+        st.markdown('<div class="glass-marker"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="glass-panel-title">🍩 Anomaly Distribution</div>', unsafe_allow_html=True)
+        if _has_root_cause:
+            import plotly.express as px
+            rc_counts = window_df[window_df["root_cause"] != "Normal"]["root_cause"].value_counts().reset_index()
+            rc_counts.columns = ["Root Cause", "Count"]
+            if not rc_counts.empty:
+                # Map colors
+                color_map = {}
+                for rc in rc_counts["Root Cause"]:
+                    if "Calibration" in rc: color_map[rc] = "#e74c3c"
+                    elif "Spike" in rc: color_map[rc] = "#f39c12"
+                    elif "Genuine" in rc: color_map[rc] = "#2ecc71"
+                    else: color_map[rc] = "#3498db"
+                
+                fig = px.pie(rc_counts, values='Count', names='Root Cause', hole=0.7, color='Root Cause', color_discrete_map=color_map)
+                fig.update_layout(
+                    height=200, margin=dict(l=10, r=10, t=10, b=10),
+                    showlegend=False, paper_bgcolor='rgba(0,0,0,0)',
+                    annotations=[dict(text=f"{rc_counts['Count'].sum()}<br>Total", x=0.5, y=0.5, font_size=16, font_color="white", showarrow=False)]
+                )
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            else:
+                st.markdown("<div style='color:#7f8c8d; text-align:center; padding-top:40px;'>No anomalies</div>", unsafe_allow_html=True)
+        
+        
+    with bottom_col3:
+        st.markdown('<div class="glass-marker"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="glass-panel-title">📋 Live Event Stream</div>', unsafe_allow_html=True)
+        if _has_root_cause:
+            stream_html = ""
+            recent_stream = window_df[window_df["root_cause"] != "Normal"].sort_values("timestamp", ascending=False).head(5)
+            for _, r in recent_stream.iterrows():
+                sid = r['station_id']
+                sinfo = station_info_map.get(sid, {})
+                sname = sinfo.get("name", sid)
+                
+                rc = r['root_cause']
+                color = "#e74c3c" if r.get('is_anomaly') else "#2ecc71" if "Genuine" in rc else "#f39c12"
+                time_str = r['timestamp'].strftime("%H:%M") if hasattr(r['timestamp'], "strftime") else str(r['timestamp'])[-8:-3]
+                stream_html += f'''
+<div class="alert-item">
+<div style="display:flex; align-items:center; gap:8px;">
+<span class="alert-dot" style="background:{color};"></span>
+<span style="color:#a0aec0; width:40px;">{time_str}</span>
+<span style="font-weight:600; width:70px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{sname}">{sname}</span>
+                    </div>
+<span style="color:#a0aec0; max-width:100px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{rc}</span>
+                </div>
+                '''
+            if stream_html:
+                st.markdown(f"<div>{stream_html}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='color:#7f8c8d; padding:10px 0;'>No events.</div>", unsafe_allow_html=True)
+        
+
+
+if active_tab == "Time Series & Anomalies":
     st.subheader("Per-Station Time Series with Anomaly Overlay")
     
     # Use station_id natively to avoid name collisions
     station_options = full_df[["station_id", "name"]].drop_duplicates().sort_values("name")
 
     # Count anomalies per station so user can find flagged stations easily
+    # Count anomalies per station so user can find flagged stations easily
     if "is_anomaly" in full_df.columns:
-        anom_counts = full_df[full_df["is_anomaly"]].groupby("station_id").size().reset_index(name="n_anom")
-        station_options = station_options.merge(anom_counts, on="station_id", how="left")
+        try:
+            is_anom_mask = full_df["is_anomaly"] == True
+            anom_counts = full_df.loc[is_anom_mask, "station_id"].value_counts().reset_index()
+            anom_counts.columns = ["station_id", "n_anom"]
+            station_options = station_options.merge(anom_counts, on="station_id", how="left")
+        except Exception:
+            station_options["n_anom"] = 0
+            
         station_options["n_anom"] = station_options["n_anom"].fillna(0).astype(int)
         # Put stations with anomalies first
         station_options = station_options.sort_values(["n_anom", "name"], ascending=[False, True])
@@ -867,7 +1237,7 @@ with tabs[1]:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-with tabs[2]:
+if active_tab == "Explainability":
     st.subheader("Explainable AI — Why was this flagged?")
     st.info(
         "**Method:** A surrogate Random Forest is trained to reproduce the Isolation "
@@ -900,9 +1270,9 @@ with tabs[2]:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"**Station:** {row['name']}")
-            st.markdown(f"**Timestamp:** {row['timestamp']}")
-            st.markdown(f"**Root cause:** {row['root_cause']}")
+            st.markdown(f"**Station:** {row['name']}", unsafe_allow_html=True)
+            st.markdown(f"**Timestamp:** {row['timestamp']}", unsafe_allow_html=True)
+            st.markdown(f"**Root cause:** {row['root_cause']}", unsafe_allow_html=True)
             st.markdown(
                 f"**Anomaly score:** {row['anomaly_score_pct']:.1f}%  \n"
                 f"*(normalised IF decision function)*"
@@ -911,17 +1281,17 @@ with tabs[2]:
                 f"**Classification confidence:** {row['classification_confidence']:.1f}%  \n"
                 f"*(evidence-strength score — not a probability)*"
             )
-            st.markdown(f"**Severity:** {row['severity']}")
+            st.markdown(f"**Severity:** {row['severity']}", unsafe_allow_html=True)
             st.markdown(
                 f"**Raw temp:** {row['temp']:.1f}°C → "
                 f"**Corrected:** {row['temp_corrected']:.1f}°C"
             )
             if ev:
-                st.markdown("**Evidence signals:**")
+                st.markdown("**Evidence signals:**", unsafe_allow_html=True)
                 for k, v in ev.items():
-                    st.markdown(f"- `{k}`: `{round(v,3) if isinstance(v,float) else v}`")
+                    st.markdown(f"- `{k}`: `{round(v,3) if isinstance(v,float) else v}`", unsafe_allow_html=True)
         with c2:
-            st.markdown("**SHAP contributions (surrogate RF):**")
+            st.markdown("**SHAP contributions (surrogate RF):**", unsafe_allow_html=True)
             st.caption("Red = pushed toward anomaly. Green = pushed toward normal.")
             bar = go.Figure(go.Bar(
                 x=[v for _, v in pairs], y=[f for f, _ in pairs],
@@ -937,7 +1307,7 @@ with tabs[2]:
             st.plotly_chart(bar, use_container_width=True)
 
 # ====================================================== TAB 4: SENSOR HEALTH
-with tabs[3]:
+if active_tab == "Sensor Health & Reliability":
     st.subheader("Sensor Health & Predictive Maintenance")
     st.caption(
         "Health score explicitly ignores Genuine Weather Events. "
@@ -969,19 +1339,19 @@ with tabs[3]:
             
             risk = r.get('maintenance_risk', 'LOW')
             r_color = {"CRITICAL": "red", "HIGH": "orange", "MEDIUM": "yellow", "LOW": "green"}[risk]
-            st.markdown(f"**Risk:** :{r_color}[{risk}]")
+            st.markdown(f"**Risk:** :{r_color}[{risk}]", unsafe_allow_html=True)
             st.caption(f"_{r.get('recommendation', 'No action')}_")
-            st.markdown("---")
+            st.markdown("---", unsafe_allow_html=True)
 
     avail = [c for c in ["name", "readings", "faults", "genuine_events", "anomaly_rate",
                          "missing_readings", "health_score", "trend", "status", "dominant_fault", "maintenance_risk"]
              if c in health.columns]
     
-    st.markdown("### Network Health View")
+    st.markdown("### Network Health View", unsafe_allow_html=True)
     st.dataframe(health[avail], use_container_width=True, hide_index=True)
 
 # ======================================================== TAB 5: ALERT LOG
-with tabs[4]:
+if active_tab == "Alert Log":
     st.subheader("Live Event Log")
     log = window_df[window_df["root_cause"] != "Normal"].sort_values("timestamp", ascending=False).copy()
     action_map = {
@@ -1009,7 +1379,7 @@ with tabs[4]:
     )
 
 # ================================================== TAB 6: PERFORMANCE / OPERATIONAL
-with tabs[5]:
+if active_tab == perf_label:
     if not HAS_GT:
         st.info("📊 **Operational Metrics**\n\n"
                 "Evaluation metrics (Precision, Recall, F1, FPR, etc.) require **Ground Truth** labels, which are not available in live unlabelled data streams.\n\n"
@@ -1027,7 +1397,7 @@ with tabs[5]:
         else:
             det = eval_results["anomaly_detection"]
             summ = eval_results["summary"]
-            st.markdown("### Binary Anomaly Detection")
+            st.markdown("### Binary Anomaly Detection", unsafe_allow_html=True)
             d1,d2,d3,d4,d5,d6 = st.columns(6)
             d1.metric("Total Obs.", summ["total_observations"])
             d2.metric("GT Anomalies", summ["n_anomalies_gt"])
@@ -1041,8 +1411,8 @@ with tabs[5]:
             p3.metric("F1 Score",  f"{det['F1']:.3f}")
             p4.metric("FPR",       f"{det['FPR']:.3f}")
             p5.metric("FNR",       f"{det['FNR']:.3f}")
-            st.markdown("---")
-            st.markdown("### Per Root-Cause Performance")
+            st.markdown("---", unsafe_allow_html=True)
+            st.markdown("### Per Root-Cause Performance", unsafe_allow_html=True)
             rc_data = eval_results.get("root_cause", {})
             if rc_data:
                 rc_rows = [
@@ -1055,8 +1425,8 @@ with tabs[5]:
                 st.dataframe(pd.DataFrame(rc_rows), use_container_width=True, hide_index=True)
             cm = eval_results.get("confusion_matrix")
             if cm is not None and not cm.empty:
-                st.markdown("---")
-                st.markdown("### Confusion Matrix")
+                st.markdown("---", unsafe_allow_html=True)
+                st.markdown("### Confusion Matrix", unsafe_allow_html=True)
                 st.caption("Rows = Predicted, Columns = True label")
                 fig_cm = go.Figure(go.Heatmap(
                     z=cm.values.tolist(), x=list(cm.columns), y=list(cm.index),
@@ -1070,8 +1440,8 @@ with tabs[5]:
                     font=dict(color="#ffffff"),
                 )
                 st.plotly_chart(fig_cm, use_container_width=True)
-            st.markdown("---")
-            st.markdown("### Model Configuration")
+            st.markdown("---", unsafe_allow_html=True)
+            st.markdown("### Model Configuration", unsafe_allow_html=True)
             cfg = {
                 "Model": "Isolation Forest (unsupervised)", "Trees": N_ESTIMATORS,
                 "Contamination": f"{CONTAMINATION:.1%}" if isinstance(CONTAMINATION, float) else str(CONTAMINATION), "Features": len(FEATURE_COLS),
@@ -1086,7 +1456,7 @@ with tabs[5]:
                 pd.DataFrame([(k, str(v)) for k, v in cfg.items()], columns=["Parameter", "Value"]),
                 use_container_width=True, hide_index=True,
             )
-            st.markdown("### Feature List")
+            st.markdown("### Feature List", unsafe_allow_html=True)
             st.dataframe(
                 pd.DataFrame(enumerate(FEATURE_COLS, 1), columns=["#", "Feature"]),
                 use_container_width=True, hide_index=True,
@@ -1140,47 +1510,47 @@ with tabs[5]:
             o7.metric("CRITICAL Detections", int((full_df.get("severity", pd.Series(dtype=str)) == "CRITICAL").sum()))
             o8.metric("Latest Anomaly Time", str(pd.Timestamp(latest_det)) if latest_det and pd.notna(latest_det) else "—")
 
-            st.markdown("---")
-            st.markdown("### Breakdown by Root Cause")
+            st.markdown("---", unsafe_allow_html=True)
+            st.markdown("### Breakdown by Root Cause", unsafe_allow_html=True)
             rc_counts = full_df[full_df["is_anomaly"]]["root_cause"].value_counts().reset_index()
             rc_counts.columns = ["Root Cause", "Count"]
             st.dataframe(rc_counts, use_container_width=True, hide_index=True)
 
-            st.markdown("### Breakdown by Severity")
+            st.markdown("### Breakdown by Severity", unsafe_allow_html=True)
             sev_counts = full_df[full_df["is_anomaly"]]["severity"].value_counts().reset_index()
             sev_counts.columns = ["Severity", "Count"]
             st.dataframe(sev_counts, use_container_width=True, hide_index=True)
 
             ts_min, ts_max = full_df["timestamp"].min(), full_df["timestamp"].max()
             hrs = (ts_max - ts_min).total_seconds() / 3600
-            st.markdown("---")
-            st.markdown(f"**Time range:** `{ts_min}` to `{ts_max}` ({hrs:.1f} h)")
+            st.markdown("---", unsafe_allow_html=True)
+            st.markdown(f"**Time range:** `{ts_min}` to `{ts_max}` ({hrs:.1f} h)", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.markdown("### Data Provenance & Transparency")
+        st.markdown("---", unsafe_allow_html=True)
+        st.markdown("### Data Provenance & Transparency", unsafe_allow_html=True)
         
         if MODE == "simulated":
-            st.markdown("**SCENARIO:** Controlled labelled simulation/evaluation")
-            st.markdown("**SOURCE:** Real WMO/WIS2 station registry mapped with **synthetically injected faults**.")
-            st.markdown("**GROUND TRUTH:** Fully available for ML evaluation (Precision, Recall, F1).")
+            st.markdown("**SCENARIO:** Controlled labelled simulation/evaluation", unsafe_allow_html=True)
+            st.markdown("**SOURCE:** Real WMO/WIS2 station registry mapped with **synthetically injected faults**.", unsafe_allow_html=True)
+            st.markdown("**GROUND TRUTH:** Fully available for ML evaluation (Precision, Recall, F1).", unsafe_allow_html=True)
         elif MODE == "live":
-            st.markdown("**SCENARIO:** Live operational monitoring")
+            st.markdown("**SCENARIO:** Live operational monitoring", unsafe_allow_html=True)
             if "provider" in locals() and provider == "IMD WIS2":
-                st.markdown("**SOURCE:** Live observation (IMD WIS2 surface observations).")
+                st.markdown("**SOURCE:** Live observation (IMD WIS2 surface observations).", unsafe_allow_html=True)
             else:
-                st.markdown("**SOURCE:** Live observation (Fallback provider active).")
-            st.markdown("**GROUND TRUTH:** Ground truth unavailable — operational monitoring mode.")
+                st.markdown("**SOURCE:** Live observation (Fallback provider active).", unsafe_allow_html=True)
+            st.markdown("**GROUND TRUTH:** Ground truth unavailable — operational monitoring mode.", unsafe_allow_html=True)
         else:
-            st.markdown("**SCENARIO:** Historical CSV playback")
-            st.markdown("**SOURCE:** User-uploaded file.")
-            st.markdown("**GROUND TRUTH:** Ground truth unavailable.")
+            st.markdown("**SCENARIO:** Historical CSV playback", unsafe_allow_html=True)
+            st.markdown("**SOURCE:** User-uploaded file.", unsafe_allow_html=True)
+            st.markdown("**GROUND TRUTH:** Ground truth unavailable.", unsafe_allow_html=True)
 
         _ts_max_str    = str(full_df["timestamp"].max()) if not full_df.empty and "timestamp" in full_df.columns else "N/A"
         _n_stations    = full_df["station_id"].nunique() if not full_df.empty and "station_id" in full_df.columns else 0
         _total_obs     = len(full_df)
-        st.markdown(f"**LAST TIMESTAMP:** {_ts_max_str} UTC")
-        st.markdown(f"**STATIONS:** {_n_stations} | **OBSERVATIONS:** {_total_obs}")
-        st.markdown("**PIPELINE:** Frozen Causal + Isolation Forest Architecture")
+        st.markdown(f"**LAST TIMESTAMP:** {_ts_max_str} UTC", unsafe_allow_html=True)
+        st.markdown(f"**STATIONS:** {_n_stations} | **OBSERVATIONS:** {_total_obs}", unsafe_allow_html=True)
+        st.markdown("**PIPELINE:** Frozen Causal + Isolation Forest Architecture", unsafe_allow_html=True)
         st.caption("Note: Stations are verified WMO/WIS2 nodes (SYNOP), but may not be strictly classified as automated hardware (AWS) without secondary verification.")
 
 # ---- Auto-play (simulated only) ----

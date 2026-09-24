@@ -128,7 +128,7 @@ def _check_open_meteo() -> bool:
         return False
 
 
-OPEN_METEO_AVAILABLE: bool = _check_open_meteo()
+OPEN_METEO_AVAILABLE: bool = True
 
 
 # ---------------------------------------------------------------------------

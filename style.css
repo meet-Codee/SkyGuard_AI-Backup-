@@ -1,0 +1,198 @@
+/* Reset and global styles */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+.stApp {
+    /* Adaptive animated background using Streamlit CSS variables */
+    background: linear-gradient(-45deg, var(--background-color), var(--secondary-background-color), var(--background-color));
+    background-size: 400% 400%;
+    animation: gradientBG 20s ease infinite;
+    font-family: 'Inter', sans-serif;
+}
+@keyframes gradientBG {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+
+/* Hide default streamlit UI elements */
+header[data-testid="stHeader"] {
+    display: none;
+}
+.stDeployButton {
+    display: none;
+}
+footer { display: none !important; }
+
+/* Glassmorphism Panels */
+.glass-panel {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 12px;
+    padding: 16px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+    margin-bottom: 16px;
+}
+
+.glass-panel-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-color);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Metric Cards */
+.metric-card {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+    height: 100%;
+}
+.metric-icon {
+    font-size: 2rem;
+    color: var(--primary-color);
+}
+.metric-icon.red { color: #e74c3c; }
+.metric-icon.green { color: #2ecc71; }
+.metric-icon.amber { color: #f39c12; }
+.metric-icon.blue { color: #3498db; }
+
+.metric-content {
+    flex-grow: 1;
+}
+.metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: var(--text-color);
+    line-height: 1.2;
+}
+.metric-label {
+    font-size: 0.8rem;
+    color: var(--text-color);
+    opacity: 0.8;
+}
+.metric-sub {
+    font-size: 0.75rem;
+    margin-top: 4px;
+}
+.text-green { color: #2ecc71; }
+.text-red { color: #e74c3c; }
+.text-blue { color: #3498db; }
+.text-amber { color: #f39c12; }
+
+/* Custom Top Header */
+.top-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    margin-bottom: 20px;
+}
+.top-header-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(46, 204, 113, 0.1);
+    border: 1px solid rgba(46, 204, 113, 0.3);
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    color: #2ecc71;
+}
+.top-header-status.warning {
+    background: rgba(243, 156, 18, 0.1);
+    border-color: rgba(243, 156, 18, 0.3);
+    color: #f39c12;
+}
+.top-header-status.error {
+    background: rgba(231, 76, 60, 0.1);
+    border-color: rgba(231, 76, 60, 0.3);
+    color: #e74c3c;
+}
+
+/* Page Title */
+.page-title-container {
+    margin-bottom: 24px;
+}
+.page-title {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: var(--text-color);
+    margin: 0 0 4px 0;
+}
+.page-subtitle {
+    font-size: 1rem;
+    color: var(--text-color);
+    opacity: 0.8;
+    margin: 0;
+}
+.accent-line {
+    width: 60px;
+    height: 3px;
+    background-color: var(--primary-color);
+    margin-top: 12px;
+    border-radius: 2px;
+}
+
+/* Alerts List */
+.alert-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(128,128,128,0.1);
+    font-size: 0.85rem;
+}
+.alert-item:last-child {
+    border-bottom: none;
+}
+.alert-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 8px;
+}
+
+/* Status List */
+.status-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    font-size: 0.9rem;
+}
+
+/* Subtle animations */
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.6; }
+    100% { opacity: 1; }
+}
+.status-pulse {
+    animation: pulse 2s infinite;
+}
+
+/* Glass Panel style targeting Streamlit columns that contain our glass-marker */
+div[data-testid="stColumn"]:has(.glass-marker),
+div[data-testid="stVerticalBlock"]:has(> .element-container .glass-marker) {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 12px;
+    padding: 16px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+    margin-bottom: 16px;
+}
+
+/* Make sure the title has some bottom margin since we separated it from the container CSS */
+.glass-panel-title {
+    margin-bottom: 15px;
+}
